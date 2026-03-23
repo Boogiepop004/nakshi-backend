@@ -19,15 +19,16 @@ app.add_middleware(
 def root():
     return {"status": "NAKSHI API running", "version": "1.0"}
 
-@app.post("/parse")
-async def parse_dst(file: UploadFile = File(...)):
-    # Validate extension
+
+# ── LIGHTWEIGHT STATS ENDPOINT (for debugging) ─────────────────────────────────
+@app.post("/stats")
+async def get_stats_only(file: UploadFile = File(...)):
+    """Returns only header stats — no stitch coordinates, tiny response"""
     filename = file.filename.lower()
     allowed = ['.dst', '.pes', '.jef', '.exp', '.vp3', '.hus']
     if not any(filename.endswith(ext) for ext in allowed):
         raise HTTPException(400, "Unsupported file format")
 
-    # Save to temp file — pyembroidery needs a file path
     suffix = os.path.splitext(filename)[1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
@@ -35,13 +36,73 @@ async def parse_dst(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        # ── Read DST header FIRST for EmCAD's exact counts ──
-        # EmCAD writes its own stitch count into the DST header
-        # This is the AUTHORITATIVE count — matches what EmCAD displays
+        # Read raw header
         raw_bytes = open(tmp_path, 'rb').read(512)
         header = raw_bytes.decode('ascii', errors='ignore')
 
-        # Extract ST (stitch count) from header — written by EmCAD
+        # Print raw header for debugging
+        print(f"RAW HEADER: {repr(header[:200])}")
+
+        st_match = re.search(r'ST\s+(\d+)', header)
+        co_match = re.search(r'CO\s+(\d+)', header)
+        px_match = re.search(r'\+X(\d+)', header)
+        mx_match = re.search(r'\-X(\d+)', header)
+        py_match = re.search(r'\+Y(\d+)', header)
+        my_match = re.search(r'\-Y(\d+)', header)
+
+        header_st = int(st_match.group(1)) if st_match else 0
+        header_co = int(co_match.group(1)) if co_match else 0
+        width_mm  = ((int(px_match.group(1)) if px_match else 0) +
+                     (int(mx_match.group(1)) if mx_match else 0)) / 10
+        height_mm = ((int(py_match.group(1)) if py_match else 0) +
+                     (int(my_match.group(1)) if my_match else 0)) / 10
+
+        # Also count with pyembroidery
+        pattern = pyembroidery.read(tmp_path)
+        py_normal = sum(1 for s in pattern.stitches if s[2] == pyembroidery.STITCH)
+        py_jumps  = sum(1 for s in pattern.stitches if s[2] in [pyembroidery.JUMP, pyembroidery.TRIM])
+        py_colors = sum(1 for s in pattern.stitches if s[2] in [pyembroidery.COLOR_CHANGE, pyembroidery.NEEDLE_SET])
+
+        return {
+            "fileName": file.filename,
+            "header": {
+                "ST_raw": st_match.group(0) if st_match else "NOT FOUND",
+                "headerST": header_st,
+                "headerCO": header_co,
+                "widthMM": width_mm,
+                "heightMM": height_mm,
+            },
+            "pyembroidery": {
+                "normalStitches": py_normal,
+                "jumpStitches": py_jumps,
+                "colorChanges": py_colors,
+                "total": py_normal + py_jumps,
+            },
+            "emcadDisplays": 40790,  # what EmCAD shows
+            "difference": 40790 - (py_normal + py_jumps),
+        }
+    finally:
+        os.unlink(tmp_path)
+
+
+# ── MAIN PARSE ENDPOINT ────────────────────────────────────────────────────────
+@app.post("/parse")
+async def parse_dst(file: UploadFile = File(...)):
+    filename = file.filename.lower()
+    allowed = ['.dst', '.pes', '.jef', '.exp', '.vp3', '.hus']
+    if not any(filename.endswith(ext) for ext in allowed):
+        raise HTTPException(400, "Unsupported file format")
+
+    suffix = os.path.splitext(filename)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        raw_bytes = open(tmp_path, 'rb').read(512)
+        header = raw_bytes.decode('ascii', errors='ignore')
+
         st_match  = re.search(r'ST\s+(\d+)', header)
         co_match  = re.search(r'CO\s+(\d+)', header)
         px_match  = re.search(r'\+X(\d+)', header)
@@ -56,16 +117,13 @@ async def parse_dst(file: UploadFile = File(...)):
         header_py = int(py_match.group(1)) if py_match else 0
         header_my = int(my_match.group(1)) if my_match else 0
 
-        # Header dimensions (0.1mm units → mm)
         header_width_mm  = (header_px + header_mx) / 10.0
         header_height_mm = (header_py + header_my) / 10.0
 
-        # ── Read with pyembroidery for stitch coordinates ──
         pattern = pyembroidery.read(tmp_path)
         if pattern is None:
             raise HTTPException(400, "Could not parse embroidery file")
 
-        # ── Extract stitches ───────────────────
         stitches_out = []
         color_index = 0
 
@@ -76,44 +134,20 @@ async def parse_dst(file: UploadFile = File(...)):
                 break
             elif cmd == pyembroidery.COLOR_CHANGE or cmd == pyembroidery.NEEDLE_SET:
                 color_index += 1
-                stitches_out.append({
-                    "x": round(x, 2),
-                    "y": round(y, 2),
-                    "t": "c",
-                    "c": color_index
-                })
+                stitches_out.append({"x": round(x, 2), "y": round(y, 2), "t": "c", "c": color_index})
             elif cmd == pyembroidery.JUMP or cmd == pyembroidery.TRIM:
-                stitches_out.append({
-                    "x": round(x, 2),
-                    "y": round(y, 2),
-                    "t": "j",
-                    "c": color_index
-                })
+                stitches_out.append({"x": round(x, 2), "y": round(y, 2), "t": "j", "c": color_index})
             elif cmd == pyembroidery.STITCH:
-                stitches_out.append({
-                    "x": round(x, 2),
-                    "y": round(y, 2),
-                    "t": "s",
-                    "c": color_index
-                })
+                stitches_out.append({"x": round(x, 2), "y": round(y, 2), "t": "s", "c": color_index})
 
-        # ── Calculate stats ────────────────────
         normal_stitches = [s for s in stitches_out if s["t"] == "s"]
         jump_stitches   = [s for s in stitches_out if s["t"] == "j"]
-        color_changes   = [s for s in stitches_out if s["t"] == "c"]
 
-        # ── STITCH COUNT: Use EmCAD's header value (authoritative) ──
-        # Falls back to pyembroidery count if header is missing
         pyembroidery_count = len(normal_stitches) + len(jump_stitches)
         stitch_count = header_st if header_st > 0 else pyembroidery_count
+        jump_count   = len(jump_stitches)
+        color_count  = (header_co + 1) if header_co > 0 else (color_index + 1)
 
-        # ── JUMP COUNT: from pyembroidery (header doesn't store this) ──
-        jump_count = len(jump_stitches)
-
-        # ── COLOR COUNT: header CO + 1, fallback to detected ──
-        color_count = (header_co + 1) if header_co > 0 else (color_index + 1)
-
-        # ── DIMENSIONS: header values, fallback to computed ──
         if header_width_mm > 0 and header_height_mm > 0:
             width_mm  = round(header_width_mm, 1)
             height_mm = round(header_height_mm, 1)
@@ -125,31 +159,25 @@ async def parse_dst(file: UploadFile = File(...)):
         else:
             width_mm = height_mm = 0
 
-        # ── Per-needle stitch analysis ─────────
         needle_stats = []
         current_needle_stitches = []
         current_color = 0
 
         for s in stitches_out:
             if s["t"] == "c":
-                needle_stats.append(_analyze_needle(
-                    current_color, current_needle_stitches
-                ))
+                needle_stats.append(_analyze_needle(current_color, current_needle_stitches))
                 current_needle_stitches = []
                 current_color = s["c"]
             elif s["t"] == "s":
                 current_needle_stitches.append(s)
 
-        # Last needle
         if current_needle_stitches:
-            needle_stats.append(_analyze_needle(
-                current_color, current_needle_stitches
-            ))
+            needle_stats.append(_analyze_needle(current_color, current_needle_stitches))
 
         return {
             "success": True,
             "fileName": file.filename,
-            "stitchCount": stitch_count,        # EmCAD's exact count from header
+            "stitchCount": stitch_count,
             "jumpCount": jump_count,
             "colorCount": color_count,
             "widthMM": width_mm,
@@ -157,7 +185,6 @@ async def parse_dst(file: UploadFile = File(...)):
             "areaCM2": round((width_mm * height_mm) / 100, 1),
             "needleStats": needle_stats,
             "stitches": stitches_out,
-            # Debug info — remove later
             "debug": {
                 "headerST": header_st,
                 "pyembroideryCount": pyembroidery_count,
@@ -170,13 +197,9 @@ async def parse_dst(file: UploadFile = File(...)):
 
 
 def _analyze_needle(color_idx: int, stitches: list) -> dict:
-    """Calculate exact material consumption per needle"""
     if not stitches:
         return {"needle": color_idx + 1, "stitchCount": 0, "pathLengthMM": 0}
 
-    stitch_count = len(stitches)
-
-    # Calculate total path length using Pythagoras
     total_length_mm = 0.0
     for i in range(1, len(stitches)):
         dx = (stitches[i]["x"] - stitches[i-1]["x"]) / 10
@@ -185,6 +208,6 @@ def _analyze_needle(color_idx: int, stitches: list) -> dict:
 
     return {
         "needle": color_idx + 1,
-        "stitchCount": stitch_count,
+        "stitchCount": len(stitches),
         "pathLengthMM": round(total_length_mm, 1),
     }
