@@ -75,7 +75,7 @@ async def parse_dst(file: UploadFile = File(...)):
         normal_stitches = [s for s in stitches_out if s["t"] == "s"]
         jump_stitches   = [s for s in stitches_out if s["t"] == "j"]
 
-        stitch_count  = len(normal_stitches)
+        stitch_count  = len(normal_stitches) + len(jump_stitches)
         jump_count    = len(jump_stitches)
         color_count   = color_index + 1
 
