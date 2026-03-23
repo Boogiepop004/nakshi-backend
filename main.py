@@ -135,7 +135,7 @@ async def parse_dst(file: UploadFile = File(...)):
             elif cmd == pyembroidery.COLOR_CHANGE or cmd == pyembroidery.NEEDLE_SET:
                 color_index += 1
                 stitches_out.append({"x": round(x, 2), "y": round(y, 2), "t": "c", "c": color_index})
-            elif cmd == pyembroidery.JUMP or cmd == pyembroidery.TRIM:
+            elif cmd == pyembroidery.JUMP or cmd == pyembroidery.TRIM or cmd == pyembroidery.SEQUIN_EJECT or cmd == pyembroidery.SEQUIN_MODE:
                 stitches_out.append({"x": round(x, 2), "y": round(y, 2), "t": "j", "c": color_index})
             elif cmd == pyembroidery.STITCH:
                 stitches_out.append({"x": round(x, 2), "y": round(y, 2), "t": "s", "c": color_index})
