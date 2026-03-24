@@ -20,77 +20,86 @@ def root():
     return {"status": "NAKSHI API running", "version": "1.0"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SEQUIN COUNTING — WHY THIS WORKS
-#
-# pyembroidery decodes Dahao sequin commands as follows:
-#   A-type head: emits 1 × SEQUIN_EJECT per physical sequin drop
-#   B-type head: emits 2 × SEQUIN_EJECT per physical sequin drop
-#               (1st = positioning move, 2nd = actual drop)
-#   SEQUIN_MODE: toggles the active head between A ↔ B
-#
-# Proof from screenshots:
-#   SEQUIN_EJECT (pyembroidery) = 8,165
-#   B-type (EmCAD)              = 2,955
-#   8,165 − 2,955               = 5,210  ← EmCAD exact sequin total ✓
-#   A-type (EmCAD)              = 2,255
-#   B-type (EmCAD)              = 2,955
-#   A + B                       = 5,210 ✓
-#
-# So: A-mode EJECTs = 2,255 (1:1)
-#     B-mode EJECTs = 2,955 × 2 = 5,910 (2:1)
-#     Total EJECTs  = 2,255 + 5,910 = 8,165 ✓
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _count_sequins_accurately(stitches):
+# ── DIAGNOSTIC ENDPOINT — call this once to understand sequin command pattern ──
+@app.post("/debug-sequins")
+async def debug_sequins(file: UploadFile = File(...)):
     """
-    Walk pyembroidery stitch list and return exact A-type and B-type counts
-    matching EmCAD's sequin accounting.
+    Logs the first 300 sequin-related pyembroidery commands in order.
+    Use this to understand the exact SEQUIN_MODE / SEQUIN_EJECT pattern
+    so we can implement the correct counting logic.
     """
-    in_b_mode      = False   # machine starts in A-mode
-    b_pending      = False   # True when we've seen the 1st (positioning) EJECT in B-mode
-    a_count        = 0
-    b_count        = 0
+    suffix = os.path.splitext(file.filename.lower())[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
 
-    for s in stitches:
-        cmd = s[2]
+    try:
+        pattern = pyembroidery.read(tmp_path)
 
-        if cmd == pyembroidery.END:
-            break
+        CMD_NAMES = {
+            pyembroidery.STITCH:       "STITCH",
+            pyembroidery.JUMP:         "JUMP",
+            pyembroidery.TRIM:         "TRIM",
+            pyembroidery.COLOR_CHANGE: "COLOR_CHANGE",
+            pyembroidery.NEEDLE_SET:   "NEEDLE_SET",
+            pyembroidery.SEQUIN_MODE:  "SEQUIN_MODE",
+            pyembroidery.SEQUIN_EJECT: "SEQUIN_EJECT",
+            pyembroidery.END:          "END",
+        }
 
-        elif cmd == pyembroidery.SEQUIN_MODE:
-            # Each occurrence toggles A ↔ B head
-            in_b_mode  = not in_b_mode
-            b_pending  = False   # reset pairing on mode switch
+        events   = []
+        count    = 0
+        total_eq = 0
+        total_em = 0
 
-        elif cmd == pyembroidery.SEQUIN_EJECT:
-            if in_b_mode:
-                if b_pending:
-                    # 2nd EJECT in the pair = actual drop
-                    b_count  += 1
-                    b_pending = False
-                else:
-                    # 1st EJECT in the pair = positioning move, skip
-                    b_pending = True
-            else:
-                # A-mode: every EJECT is a real sequin
-                a_count += 1
+        for s in pattern.stitches:
+            cmd = s[2]
+            if cmd == pyembroidery.SEQUIN_EJECT:
+                total_eq += 1
+            if cmd == pyembroidery.SEQUIN_MODE:
+                total_em += 1
+            if cmd in (pyembroidery.SEQUIN_MODE, pyembroidery.SEQUIN_EJECT):
+                if count < 300:
+                    events.append({
+                        "index": len([x for x in pattern.stitches[:pattern.stitches.index(s)+1]]),
+                        "cmd":   CMD_NAMES.get(cmd, str(cmd)),
+                        "x":     round(s[0], 1),
+                        "y":     round(s[1], 1),
+                    })
+                count += 1
 
-        elif cmd in (pyembroidery.COLOR_CHANGE, pyembroidery.NEEDLE_SET,
-                     pyembroidery.JUMP, pyembroidery.TRIM, pyembroidery.STITCH):
-            # Any non-sequin command resets the B-mode pairing state
-            # (but does NOT reset in_b_mode — head stays as-is until SEQUIN_MODE)
-            b_pending = False
+        # Also show what surrounds the first SEQUIN_MODE — 5 commands before and after
+        context = []
+        for i, s in enumerate(pattern.stitches):
+            if s[2] == pyembroidery.SEQUIN_MODE:
+                start = max(0, i - 5)
+                end   = min(len(pattern.stitches), i + 10)
+                for j in range(start, end):
+                    ss = pattern.stitches[j]
+                    context.append({
+                        "pos":       j,
+                        "cmd":       CMD_NAMES.get(ss[2], str(ss[2])),
+                        "x":         round(ss[0], 1),
+                        "y":         round(ss[1], 1),
+                        "is_target": j == i,
+                    })
+                break  # only first SEQUIN_MODE context
 
-    return a_count, b_count
+        return {
+            "totalSequinEjects": total_eq,
+            "totalSequinModes":  total_em,
+            "firstModeContext":  context,
+            "first300SequinEvents": events,
+        }
+    finally:
+        os.unlink(tmp_path)
 
 
 # ── LIGHTWEIGHT STATS ENDPOINT ─────────────────────────────────────────────────
 @app.post("/stats")
 async def get_stats_only(file: UploadFile = File(...)):
-    """Returns only stats — no stitch coordinates, tiny response"""
     filename = file.filename.lower()
-    allowed = ['.dst', '.pes', '.jef', '.exp', '.vp3', '.hus']
+    allowed  = ['.dst', '.pes', '.jef', '.exp', '.vp3', '.hus']
     if not any(filename.endswith(ext) for ext in allowed):
         raise HTTPException(400, "Unsupported file format")
 
@@ -130,30 +139,23 @@ async def get_stats_only(file: UploadFile = File(...)):
         py_colors       = sum(1 for s in pattern.stitches
                               if s[2] in [pyembroidery.COLOR_CHANGE, pyembroidery.NEEDLE_SET])
 
-        a_sequins, b_sequins = _count_sequins_accurately(pattern.stitches)
-        actual_sequins = a_sequins + b_sequins
-        py_total       = py_normal + py_jumps + actual_sequins
-
         return {
             "fileName": file.filename,
             "header": {
-                "ST_raw":    st_match.group(0) if st_match else "NOT FOUND",
-                "headerST":  header_st,
-                "headerCO":  header_co,
-                "widthMM":   width_mm,
-                "heightMM":  height_mm,
+                "ST_raw":   st_match.group(0) if st_match else "NOT FOUND",
+                "headerST": header_st,
+                "headerCO": header_co,
+                "widthMM":  width_mm,
+                "heightMM": height_mm,
             },
             "pyembroidery": {
                 "normalStitches":  py_normal,
                 "jumpStitches":    py_jumps,
                 "sequinEjects":    py_sequin_eject,
                 "sequinModes":     py_sequin_mode,
-                "aTypeSequins":    a_sequins,
-                "bTypeSequins":    b_sequins,
-                "actualSequins":   actual_sequins,
                 "colorChanges":    py_colors,
-                "total":           py_total,
             },
+            "note": "Call /debug-sequins with this file to determine correct sequin formula",
         }
     finally:
         os.unlink(tmp_path)
@@ -163,7 +165,7 @@ async def get_stats_only(file: UploadFile = File(...)):
 @app.post("/parse")
 async def parse_dst(file: UploadFile = File(...)):
     filename = file.filename.lower()
-    allowed = ['.dst', '.pes', '.jef', '.exp', '.vp3', '.hus']
+    allowed  = ['.dst', '.pes', '.jef', '.exp', '.vp3', '.hus']
     if not any(filename.endswith(ext) for ext in allowed):
         raise HTTPException(400, "Unsupported file format")
 
@@ -201,78 +203,55 @@ async def parse_dst(file: UploadFile = File(...)):
         stitches_out = []
         color_index  = 0
 
-        # ── Sequin state machine ───────────────────────────────────────────
-        in_b_mode     = False   # toggles on each SEQUIN_MODE
-        b_pending     = False   # True after 1st (positioning) EJECT in B-mode
-        b_pending_pos = (0, 0)  # position of 1st EJECT (discarded)
+        # ── Sequin pass: count SEQUIN_MODE events to determine B-type count
+        # Current best model (pending /debug-sequins confirmation):
+        #   SEQUIN_MODE signals exactly one B-type sequin drop.
+        #   All remaining EJECTs (EJECTs - MODEs) are A-type.
+        # This is recorded but NOT used for stitches_out positions yet —
+        # positions still use all EJECTs so the canvas preview is complete.
+        sequin_mode_count  = sum(1 for s in pattern.stitches
+                                 if s[2] == pyembroidery.SEQUIN_MODE)
+        sequin_eject_count = sum(1 for s in pattern.stitches
+                                 if s[2] == pyembroidery.SEQUIN_EJECT)
 
         for stitch in pattern.stitches:
             x, y, cmd = stitch[0], stitch[1], stitch[2]
 
             if cmd == pyembroidery.END:
                 break
-
             elif cmd in (pyembroidery.COLOR_CHANGE, pyembroidery.NEEDLE_SET):
                 color_index += 1
-                b_pending    = False
                 stitches_out.append({
                     "x": round(x, 2), "y": round(y, 2),
                     "t": "c", "c": color_index
                 })
-
             elif cmd in (pyembroidery.JUMP, pyembroidery.TRIM):
-                b_pending = False
                 stitches_out.append({
                     "x": round(x, 2), "y": round(y, 2),
                     "t": "j", "c": color_index
                 })
-
             elif cmd == pyembroidery.SEQUIN_MODE:
-                # Toggle A ↔ B head — do NOT emit a stitch record
-                in_b_mode = not in_b_mode
-                b_pending  = False
-
+                # Don't emit — counted separately
+                pass
             elif cmd == pyembroidery.SEQUIN_EJECT:
-                if in_b_mode:
-                    if b_pending:
-                        # 2nd EJECT = actual B-type sequin drop — use THIS position
-                        stitches_out.append({
-                            "x": round(x, 2), "y": round(y, 2),
-                            "t": "q", "c": color_index
-                        })
-                        b_pending = False
-                    else:
-                        # 1st EJECT = positioning move — remember pos, skip record
-                        b_pending_pos = (x, y)
-                        b_pending     = True
-                else:
-                    # A-mode: every EJECT is a real sequin drop
-                    b_pending = False
-                    stitches_out.append({
-                        "x": round(x, 2), "y": round(y, 2),
-                        "t": "q", "c": color_index
-                    })
-
+                # Emit for canvas preview (all positions)
+                stitches_out.append({
+                    "x": round(x, 2), "y": round(y, 2),
+                    "t": "q", "c": color_index
+                })
             elif cmd == pyembroidery.STITCH:
-                b_pending = False
                 stitches_out.append({
                     "x": round(x, 2), "y": round(y, 2),
                     "t": "s", "c": color_index
                 })
 
-        # ── Totals ─────────────────────────────────────────────────────────
         normal_stitches = [s for s in stitches_out if s["t"] == "s"]
         jump_stitches   = [s for s in stitches_out if s["t"] == "j"]
         sequin_stitches = [s for s in stitches_out if s["t"] == "q"]
 
-        # Matches EmCAD: normal + jumps + correctly-counted sequins
-        stitch_count = (len(normal_stitches)
-                        + len(jump_stitches)
-                        + len(sequin_stitches))
-        jump_count   = len(jump_stitches)
-        color_count  = (header_co + 1) if header_co > 0 else (color_index + 1)
+        color_count = (header_co + 1) if header_co > 0 else (color_index + 1)
 
-        # ── Dimensions ─────────────────────────────────────────────────────
+        # ── Dimensions ──────────────────────────────────────────────────────
         if header_width_mm > 0 and header_height_mm > 0:
             width_mm  = round(header_width_mm, 1)
             height_mm = round(header_height_mm, 1)
@@ -285,9 +264,9 @@ async def parse_dst(file: UploadFile = File(...)):
             width_mm = height_mm = 0
 
         # ── Per-needle analysis ─────────────────────────────────────────────
-        needle_stats          = []
-        current_needle_sts    = []
-        current_color         = 0
+        needle_stats       = []
+        current_needle_sts = []
+        current_color      = 0
 
         for s in stitches_out:
             if s["t"] == "c":
@@ -307,8 +286,8 @@ async def parse_dst(file: UploadFile = File(...)):
         return {
             "success":     True,
             "fileName":    file.filename,
-            "stitchCount": stitch_count,
-            "jumpCount":   jump_count,
+            "stitchCount": len(normal_stitches) + len(jump_stitches) + len(sequin_stitches),
+            "jumpCount":   len(jump_stitches),
             "sequinCount": len(sequin_stitches),
             "colorCount":  color_count,
             "widthMM":     width_mm,
@@ -320,8 +299,11 @@ async def parse_dst(file: UploadFile = File(...)):
                 "normalStitches":  len(normal_stitches),
                 "jumpStitches":    len(jump_stitches),
                 "sequinStitches":  len(sequin_stitches),
+                "sequinEjects":    sequin_eject_count,
+                "sequinModes":     sequin_mode_count,
                 "headerST":        header_st,
                 "headerCO":        header_co,
+                "note":            "Call /debug-sequins to determine correct sequin formula",
             }
         }
 
@@ -330,7 +312,6 @@ async def parse_dst(file: UploadFile = File(...)):
 
 
 def _analyze_needle(color_idx: int, stitches: list) -> dict:
-    """Calculate material consumption per needle (normal + sequin stitches)"""
     if not stitches:
         return {"needle": color_idx + 1, "stitchCount": 0, "pathLengthMM": 0}
 
@@ -341,7 +322,7 @@ def _analyze_needle(color_idx: int, stitches: list) -> dict:
         total_length_mm += math.sqrt(dx * dx + dy * dy)
 
     return {
-        "needle":        color_idx + 1,
-        "stitchCount":   len(stitches),
-        "pathLengthMM":  round(total_length_mm, 1),
+        "needle":       color_idx + 1,
+        "stitchCount":  len(stitches),
+        "pathLengthMM": round(total_length_mm, 1),
     }
